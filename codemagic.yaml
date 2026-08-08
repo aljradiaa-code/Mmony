@@ -1,0 +1,225 @@
+workflows:
+  ios-workflow:
+    name: Store Wallet iOS - Robust EAS Build
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+
+    environment:
+      groups:
+        - app_store_credentials
+      vars:
+        BUNDLE_ID: "com.yourcompany.storewallet"
+      node: 20
+      xcode: latest
+
+    cache:
+      cache_paths:
+        - "$HOME/.npm"
+        - "$HOME/.yarn"
+        - "$HOME/Library/Caches/CocoaPods"
+        - "node_modules"
+
+    triggering:
+      events:
+        - push
+        - pull_request
+      branch_patterns:
+        - pattern: main
+          include: true
+          source: true
+
+    scripts:
+      - name: Prepare project - extract ZIP if needed
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          echo "=== Repository layout ==="
+          pwd
+          find . -maxdepth 3 -type f \
+            \( -name "package.json" -o -name "app.json" -o -name "eas.json" -o -name "codemagic.yaml" -o -name "*.zip" \) \
+            -not -path "*/node_modules/*" -print | sort || true
+
+          # Supports both:
+          #   1) project files directly in the repository root
+          #   2) a ZIP containing the project
+          if [ ! -f "package.json" ]; then
+            ZIP_FILE="$(find . -maxdepth 2 -type f -name "*.zip" \
+              -not -path "*/node_modules/*" | head -n 1 || true)"
+
+            if [ -n "${ZIP_FILE:-}" ]; then
+              echo "package.json not found at repository root."
+              echo "Extracting: $ZIP_FILE"
+              command -v unzip >/dev/null 2>&1 || {
+                echo "ERROR: unzip is not available."
+                exit 1
+              }
+              unzip -o "$ZIP_FILE" -d .
+            fi
+          fi
+
+          # Locate the actual Expo project even when the ZIP has a wrapper folder
+          # such as ./store-wallet-app/package.json.
+          PROJECT_DIR="$(find . -maxdepth 4 -type f -name package.json \
+            -not -path "*/node_modules/*" \
+            -not -path "*/.git/*" \
+            -print | head -n 1 | xargs -I{} dirname "{}" || true)"
+
+          if [ -z "${PROJECT_DIR:-}" ]; then
+            echo "ERROR: No package.json was found after extraction."
+            exit 1
+          fi
+
+          PROJECT_DIR="${PROJECT_DIR#./}"
+          [ "$PROJECT_DIR" = "." ] && PROJECT_DIR="."
+
+          echo "PROJECT_DIR=$PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$CM_ENV"
+
+      - name: Install dependencies with fallback package managers
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          node --version
+          npm --version
+
+          if [ -f "pnpm-lock.yaml" ]; then
+            echo "Using pnpm"
+            command -v pnpm >/dev/null 2>&1 || npm install -g pnpm@latest
+            pnpm install --frozen-lockfile || pnpm install
+
+          elif [ -f "yarn.lock" ]; then
+            echo "Using Yarn"
+            if ! command -v yarn >/dev/null 2>&1; then
+              corepack enable || true
+              corepack prepare yarn@stable --activate || npm install -g yarn@latest
+            fi
+            yarn install --immutable || yarn install --frozen-lockfile || yarn install
+
+          elif [ -f "package-lock.json" ]; then
+            echo "Using npm ci"
+            npm ci || npm ci --legacy-peer-deps || npm install --legacy-peer-deps
+
+          else
+            echo "No lockfile found; using npm install."
+            npm install --legacy-peer-deps || npm install
+          fi
+
+      - name: Install and validate EAS CLI
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          if ! npx --yes eas-cli@latest --version; then
+            echo "npx EAS CLI failed; using global fallback."
+            npm install -g eas-cli@latest
+            eas --version
+          fi
+
+          if [ -z "${EXPO_TOKEN:-}" ]; then
+            echo "ERROR: EXPO_TOKEN is missing from Codemagic."
+            exit 1
+          fi
+
+          # IMPORTANT:
+          # Do NOT use: eas login --token ...
+          # Current EAS CLI authenticates from EXPO_TOKEN automatically.
+          echo "Expo token detected."
+
+      - name: Link EAS project if projectId is a placeholder
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ -f "app.json" ] && grep -q '"projectId"[[:space:]]*:[[:space:]]*"your-eas-project-id"' app.json; then
+            echo "Placeholder EAS projectId detected."
+            npx --yes eas-cli@latest init --force --non-interactive
+          fi
+
+          # Verify final EAS configuration.
+          npx --yes eas-cli@latest config --json --non-interactive
+
+      - name: Repair missing Expo assets if necessary
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          # The supplied ZIP references these PNG files but does not contain them.
+          # This creates build-safe placeholders; replace them with real artwork later.
+          mkdir -p assets
+          PNG_B64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+
+          for f in icon.png splash.png adaptive-icon.png favicon.png; do
+            if [ ! -f "assets/$f" ]; then
+              echo "Missing assets/$f -> creating fallback placeholder."
+              printf '%s' "$PNG_B64" | base64 --decode > "assets/$f"
+            fi
+          done
+
+      - name: Final preflight
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          test -f package.json
+          test -f eas.json
+          test -f app.json || test -f app.config.js || test -f app.config.ts
+
+          npx expo --version
+          npx expo-doctor || true
+          npx --yes eas-cli@latest config --json --non-interactive
+
+      - name: Build iOS on EAS
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          rm -rf build
+          mkdir -p build
+
+          npx --yes eas-cli@latest build \
+            --platform ios \
+            --profile production \
+            --non-interactive \
+            --wait
+
+      - name: Download finished EAS IPA
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          mkdir -p build
+
+          npx --yes eas-cli@latest build:download \
+            --platform ios \
+            --non-interactive
+
+          IPA="$(find . -maxdepth 3 -type f -name "*.ipa" \
+            -not -path "*/node_modules/*" | head -n 1 || true)"
+
+          if [ -z "${IPA:-}" ]; then
+            echo "ERROR: EAS build finished but no IPA was downloaded."
+            exit 1
+          fi
+
+          cp "$IPA" "build/Store-Wallet.ipa"
+          ls -lh build/Store-Wallet.ipa
+
+    artifacts:
+      - "**/build/*.ipa"
+      - "**/*.ipa"
+
+    publishing:
+      email:
+        recipients:
+          - $CM_COMMIT_AUTHOR_EMAIL
+        notify:
+          success: true
+          failure: true
