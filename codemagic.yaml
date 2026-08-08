@@ -1,0 +1,421 @@
+workflows:
+  ios-workflow:
+    name: Store Wallet - Robust iOS EAS Build
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+
+    environment:
+      node: 20
+      xcode: latest
+
+    cache:
+      cache_paths:
+        - "$HOME/.npm"
+        - "$HOME/.yarn"
+        - "$HOME/Library/Caches/CocoaPods"
+        - "node_modules"
+
+    triggering:
+      events:
+        - push
+        - pull_request
+      branch_patterns:
+        - pattern: main
+          include: true
+          source: true
+
+    scripts:
+
+      # ------------------------------------------------------------
+      # 1) Detect the project and extract ZIP archives when needed
+      # ------------------------------------------------------------
+      - name: Detect and prepare project
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          echo "========================================"
+          echo "1. Detecting project structure"
+          echo "========================================"
+
+          echo "Current directory:"
+          pwd
+
+          echo "Repository files:"
+          find . -maxdepth 4 -type f \
+            \( -name "package.json" \
+            -o -name "app.json" \
+            -o -name "app.config.js" \
+            -o -name "app.config.ts" \
+            -o -name "eas.json" \
+            -o -name "*.zip" \) \
+            -not -path "*/node_modules/*" \
+            -not -path "*/.git/*" \
+            -print | sort || true
+
+          # First look for package.json anywhere in the repository.
+          PROJECT_DIR=""
+
+          if [ -f "./package.json" ]; then
+            PROJECT_DIR="."
+          else
+            FOUND_PACKAGE="$(find . -maxdepth 5 -type f -name "package.json" \
+              -not -path "*/node_modules/*" \
+              -not -path "*/.git/*" \
+              -print -quit || true)"
+
+            if [ -n "${FOUND_PACKAGE:-}" ]; then
+              PROJECT_DIR="$(dirname "$FOUND_PACKAGE")"
+            fi
+          fi
+
+          # If package.json does not exist, search for a ZIP and extract it.
+          if [ -z "${PROJECT_DIR:-}" ]; then
+            ZIP_FILE="$(find . -maxdepth 3 -type f -iname "*.zip" \
+              -not -path "*/node_modules/*" \
+              -not -path "*/.git/*" \
+              -print -quit || true)"
+
+            if [ -n "${ZIP_FILE:-}" ]; then
+              echo "No package.json found."
+              echo "ZIP detected: $ZIP_FILE"
+
+              if ! command -v unzip >/dev/null 2>&1; then
+                echo "ERROR: unzip is not available on this build machine."
+                exit 1
+              fi
+
+              echo "Extracting ZIP..."
+              unzip -o "$ZIP_FILE" -d .
+
+              FOUND_PACKAGE="$(find . -maxdepth 6 -type f -name "package.json" \
+                -not -path "*/node_modules/*" \
+                -not -path "*/.git/*" \
+                -print -quit || true)"
+
+              if [ -n "${FOUND_PACKAGE:-}" ]; then
+                PROJECT_DIR="$(dirname "$FOUND_PACKAGE")"
+              fi
+            fi
+          fi
+
+          if [ -z "${PROJECT_DIR:-}" ]; then
+            echo "ERROR: Could not find package.json."
+            echo "The repository must contain an Expo/Node project or a ZIP containing one."
+            exit 1
+          fi
+
+          # Normalize ./project to project, while preserving ".".
+          if [ "$PROJECT_DIR" != "." ]; then
+            PROJECT_DIR="${PROJECT_DIR#./}"
+          fi
+
+          echo "========================================"
+          echo "Detected project directory: $PROJECT_DIR"
+          echo "========================================"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$CM_ENV"
+
+          cd "$PROJECT_DIR"
+
+          echo "Project contents:"
+          ls -la
+
+          echo "package.json:"
+          test -f package.json
+
+      # ------------------------------------------------------------
+      # 2) Install dependencies with npm / yarn / pnpm fallback
+      # ------------------------------------------------------------
+      - name: Install project dependencies
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          echo "========================================"
+          echo "2. Installing dependencies"
+          echo "========================================"
+
+          node --version
+          npm --version
+
+          if [ -f "pnpm-lock.yaml" ]; then
+            echo "pnpm-lock.yaml detected."
+
+            if ! command -v pnpm >/dev/null 2>&1; then
+              echo "Installing pnpm..."
+              npm install -g pnpm@latest
+            fi
+
+            pnpm install --frozen-lockfile || pnpm install
+
+          elif [ -f "yarn.lock" ]; then
+            echo "yarn.lock detected."
+
+            if ! command -v yarn >/dev/null 2>&1; then
+              echo "Enabling Yarn through Corepack..."
+              corepack enable || true
+              corepack prepare yarn@stable --activate || npm install -g yarn@latest
+            fi
+
+            yarn install --immutable || \
+            yarn install --frozen-lockfile || \
+            yarn install
+
+          elif [ -f "package-lock.json" ]; then
+            echo "package-lock.json detected."
+
+            npm ci || \
+            npm ci --legacy-peer-deps || \
+            npm install --legacy-peer-deps
+
+          else
+            echo "No lockfile detected."
+            echo "Using npm install with peer-dependency fallback."
+
+            npm install --legacy-peer-deps || npm install
+          fi
+
+      # ------------------------------------------------------------
+      # 3) Install EAS CLI and authenticate using EXPO_TOKEN
+      #    IMPORTANT: Do NOT run 'eas login --token'.
+      # ------------------------------------------------------------
+      - name: Install and validate EAS CLI
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          echo "========================================"
+          echo "3. Installing EAS CLI"
+          echo "========================================"
+
+          if npx --yes eas-cli@latest --version; then
+            echo "EAS CLI is available through npx."
+          else
+            echo "npx EAS CLI failed."
+            echo "Installing global fallback..."
+            npm install -g eas-cli@latest
+            eas --version
+          fi
+
+          if [ -z "${EXPO_TOKEN:-}" ]; then
+            echo "ERROR: EXPO_TOKEN is not configured in Codemagic."
+            echo ""
+            echo "Create a secure Codemagic environment variable named:"
+            echo "EXPO_TOKEN"
+            echo ""
+            echo "Do NOT put the token directly inside codemagic.yaml."
+            exit 1
+          fi
+
+          echo "EXPO_TOKEN detected."
+          echo "EAS will authenticate automatically through EXPO_TOKEN."
+          echo "No 'eas login --token' command is used."
+
+      # ------------------------------------------------------------
+      # 4) Link/create EAS project when app.json contains a placeholder
+      # ------------------------------------------------------------
+      - name: Configure EAS project
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          echo "========================================"
+          echo "4. Configuring EAS project"
+          echo "========================================"
+
+          CONFIG_FILE=""
+
+          if [ -f "app.json" ]; then
+            CONFIG_FILE="app.json"
+          elif [ -f "app.config.js" ]; then
+            CONFIG_FILE="app.config.js"
+          elif [ -f "app.config.ts" ]; then
+            CONFIG_FILE="app.config.ts"
+          fi
+
+          if [ -z "${CONFIG_FILE:-}" ]; then
+            echo "ERROR: No Expo configuration file found."
+            echo "Expected app.json, app.config.js, or app.config.ts."
+            exit 1
+          fi
+
+          echo "Expo configuration: $CONFIG_FILE"
+
+          NEED_INIT="false"
+
+          if [ "$CONFIG_FILE" = "app.json" ]; then
+            if grep -q '"projectId"[[:space:]]*:[[:space:]]*"your-eas-project-id"' app.json; then
+              NEED_INIT="true"
+            fi
+
+            if grep -q '"projectId"[[:space:]]*:[[:space:]]*""' app.json; then
+              NEED_INIT="true"
+            fi
+          fi
+
+          if [ "$NEED_INIT" = "true" ]; then
+            echo "Placeholder/empty EAS projectId detected."
+            echo "Initializing/linking the EAS project..."
+
+            npx --yes eas-cli@latest init \
+              --force \
+              --non-interactive
+          else
+            echo "No placeholder projectId detected."
+            echo "Using existing EAS project configuration."
+          fi
+
+          echo "Checking EAS configuration..."
+          npx --yes eas-cli@latest config \
+            --json \
+            --non-interactive
+
+      # ------------------------------------------------------------
+      # 5) Create fallback assets if referenced assets are missing
+      # ------------------------------------------------------------
+      - name: Validate and repair missing assets
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          echo "========================================"
+          echo "5. Checking Expo assets"
+          echo "========================================"
+
+          mkdir -p assets
+
+          # Minimal valid 1x1 PNG.
+          PNG_B64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+
+          create_fallback() {
+            local FILE="$1"
+
+            if [ ! -f "$FILE" ]; then
+              echo "Missing: $FILE"
+              echo "Creating temporary fallback PNG."
+              printf '%s' "$PNG_B64" | base64 --decode > "$FILE"
+            else
+              echo "Found: $FILE"
+            fi
+          }
+
+          # These are created only if absent.
+          # Replace them later with the real application artwork.
+          create_fallback "assets/icon.png"
+          create_fallback "assets/splash.png"
+          create_fallback "assets/adaptive-icon.png"
+          create_fallback "assets/favicon.png"
+
+          echo "Asset validation completed."
+
+      # ------------------------------------------------------------
+      # 6) Expo preflight
+      # ------------------------------------------------------------
+      - name: Run Expo preflight checks
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          echo "========================================"
+          echo "6. Expo preflight"
+          echo "========================================"
+
+          test -f package.json
+          test -f eas.json
+
+          if [ -f "app.json" ] || \
+             [ -f "app.config.js" ] || \
+             [ -f "app.config.ts" ]; then
+            echo "Expo configuration found."
+          else
+            echo "ERROR: Expo configuration not found."
+            exit 1
+          fi
+
+          echo "Expo version:"
+          npx expo --version
+
+          echo "Running Expo Doctor..."
+          npx expo-doctor || true
+
+          echo "Final EAS configuration:"
+          npx --yes eas-cli@latest config \
+            --json \
+            --non-interactive
+
+      # ------------------------------------------------------------
+      # 7) Build iOS through EAS
+      # ------------------------------------------------------------
+      - name: Build iOS with EAS
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          echo "========================================"
+          echo "7. Starting EAS iOS build"
+          echo "========================================"
+
+          mkdir -p build
+
+          npx --yes eas-cli@latest build \
+            --platform ios \
+            --profile production \
+            --non-interactive \
+            --wait
+
+      # ------------------------------------------------------------
+      # 8) Download IPA generated by EAS
+      # ------------------------------------------------------------
+      - name: Download EAS IPA
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          echo "========================================"
+          echo "8. Downloading IPA"
+          echo "========================================"
+
+          mkdir -p build
+
+          npx --yes eas-cli@latest build:download \
+            --platform ios \
+            --non-interactive
+
+          IPA_FILE="$(find . -type f -name "*.ipa" \
+            -not -path "*/node_modules/*" \
+            -not -path "*/.git/*" \
+            -not -path "./build/Store-Wallet.ipa" \
+            -print -quit || true)"
+
+          if [ -z "${IPA_FILE:-}" ]; then
+            echo "ERROR: EAS build completed but no IPA was found."
+            echo "Searching entire project:"
+            find . -type f -name "*.ipa" -print || true
+            exit 1
+          fi
+
+          echo "IPA found: $IPA_FILE"
+
+          cp "$IPA_FILE" "build/Store-Wallet.ipa"
+
+          echo "Final artifact:"
+          ls -lh "build/Store-Wallet.ipa"
+
+    artifacts:
+      - "**/build/*.ipa"
+      - "**/*.ipa"
